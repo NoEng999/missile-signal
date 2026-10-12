@@ -8,7 +8,7 @@ GitHubはコード保存用です。実行には24時間稼働のLinuxサーバ�
 
 - `SIGNAL_ACCOUNT`: 連携済みSignalアカウント
 - `SIGNAL_GROUP_ID`: 本番送信先のグループID（必須）
-- `SIGNAL_RPC`: 同じサーバーで共有するSignal JSON-RPC URL。Docker内では `http://signal:8080/api/v1/rpc` など。外部公開しないでください。
+- `SIGNAL_RPC`: 同じサーバーで共有するSignal JSON-RPC URL。Docker内では `http://signal:18765/api/v1/rpc` など。外部公開しないでください。
 - `DATA_DIR`: 永続保存ディレクトリ。Dockerの既定は `/data`。UID 10001に書き込み権限が必要。
 - `SIGNAL_CONFIG_FILE`: 任意。サーバー内の非公開JSON設定ファイル。環境変数が優先します。
 - `INTERVAL_SECONDS`: 監視間隔。既定10秒、最低5秒。
@@ -20,3 +20,4 @@ GitHubはコード保存用です。実行には24時間稼働のLinuxサーバ�
 起動時は過去記事を履歴として登録し通知しません。未送信キューは永続DBから再試行します。送信成功はSignalサービスの受付確認で、受信端末の配信保証ではありません。RPC成功後にDB記録前に停止した場合、再送の可能性があります。通知本文は永続ディレクトリの非公開ログにも保存されます。
 
 ローカル確認: `python -m unittest test_monitor test_server -v`。ネットワーク・実送信を使わずに実行できます。
+
