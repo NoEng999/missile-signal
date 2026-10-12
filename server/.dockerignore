@@ -1,0 +1,9 @@
+data
+runtime
+tools
+*.json
+*.sqlite3*
+*.log
+.env*
+__pycache__
+.git
