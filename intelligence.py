@@ -37,7 +37,7 @@ def time_value(match):
 TIME=r'(?P<period>午前|午後)?(?P<hour>\d{1,2})時(?:(?P<minute>\d{1,2})分)?'
 def sentences(t): return [s.strip() for s in re.split(r'[。\n]',t) if s.strip()]
 def extract(e):
-    t=normalize(e['text']); compact=re.sub(r'\s+','',t); relevant=[]
+    t='\n'.join(normalize(p) for p in e['text'].splitlines()); compact=re.sub(r'\s+','',t); relevant=[]
     for sentence in sentences(t):
         if re.search(r'北朝鮮|ミサイル|発射|落下|落着|弾着|着弾|EEZ|排他的経済水域|領海',sentence): relevant.append(sentence)
     facts={}

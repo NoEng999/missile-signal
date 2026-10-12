@@ -3,12 +3,13 @@ import concurrent.futures as cf
 import hashlib, io, json, logging, queue, re, sqlite3, subprocess, threading, time, uuid, os
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 import xml.etree.ElementTree as ET
 import requests
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from intelligence import FIELDS, options, extract, render, canonical_url, semantic_signature
+from nhk_article import parse_nhk
 
 ROOT=Path(__file__).resolve().parent
 DATA=ROOT/'data'; DATA.mkdir(exist_ok=True)
@@ -47,6 +48,7 @@ class Engine:
     def __init__(self,config=None):
         self.config=config or load_config(); self.stop=threading.Event(); self.events=queue.Queue(); self.lock=threading.RLock()
         self.detail_inflight=set()
+        self.article_dates={}
         self.pool=cf.ThreadPoolExecutor(max_workers=8); self.status={}; self.threads=[]; self.responses=[]
         self.db=sqlite3.connect(DATA/'monitor.sqlite3',check_same_thread=False)
         self.db.execute('CREATE TABLE IF NOT EXISTS seen (key TEXT PRIMARY KEY)')
@@ -132,6 +134,10 @@ class Engine:
         r=self.fetch(url)
         if 'application/pdf' in r.headers.get('Content-Type','') or url.endswith('.pdf'):
             return '\n'.join(p.extract_text() or '' for p in PdfReader(io.BytesIO(r.content)).pages)
+        if urlsplit(url).hostname in ('news.web.nhk','www3.nhk.or.jp','www.nhk.or.jp'):
+            body,published=parse_nhk(r.content.decode('utf-8','replace'))
+            self.article_dates[url]=published
+            return body
         soup=BeautifulSoup(r.content.decode('utf-8','replace'),'html.parser')
         for x in soup.find_all(['script','style','nav','footer','header']): x.decompose()
         node=soup.find('article') or soup.find('main') or soup.find(id='main') or soup
@@ -173,7 +179,7 @@ class Engine:
         return count
     def nhk_detail(self,e,baseline=False):
         try:
-            text=self.article(e['url']); e=dict(e,text=e['title']+' '+text,detected=now())
+            text=self.article(e['url']); e=dict(e,text=text,detected=now(),published=self.article_dates.get(e['url']) or e.get('published',''))
             self.accept(e,baseline)
         except Exception as ex: self.log('NHK詳細取得エラー: '+type(ex).__name__)
         finally:
