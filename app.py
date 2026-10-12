@@ -6,11 +6,11 @@ import qrcode
 from monitor import *
 
 def main(smoke=False):
-    root=tk.Tk(); root.title('北朝鮮ミサイル → Signal / PC試運転'); root.geometry('1030x780')
+    root=tk.Tk(); root.title('北朝鮮ミサイル → Signal / PC試運転'); root.geometry('1080x900')
     config=load_config(); engine=Engine(config); jobs=queue.Queue(); daemon=[None]; linkproc=[None]; started=[False]
     frame=ttk.Frame(root,padding=16); frame.pack(fill='both',expand=True)
     ttk.Label(frame,text='ミサイル発射情報モニター',font=('Yu Gothic UI',20,'bold')).pack(anchor='w')
-    ttk.Label(frame,text='第一報を優先送信 / 詳細は続報 / 情報源ごとの重複を許容 / PCの起動中のみ監視').pack(anchor='w',pady=(2,12))
+    ttk.Label(frame,text='発射の事実を優先 / 履歴から重複を抑止 / 新しい情報は更新通知 / PCの起動中のみ監視').pack(anchor='w',pady=(2,12))
     settings=ttk.LabelFrame(frame,text='設定',padding=10); settings.pack(fill='x')
     account=tk.StringVar(value=config['signal_account']); recipient=tk.StringVar(value=config['signal_recipient']); token=tk.StringVar(value=config['x_bearer_token']); interval=tk.StringVar(value=str(config['interval_seconds']))
     for row,(label,var,hide) in enumerate([('Signalアカウント（QR連携後に自動入力）',account,False),('送信先：空欄は自分のメモ / 他の端末は +国番号…',recipient,False),('X API Bearer Token（未設定ならXは停止）',token,True),('Web取得間隔（秒、最小5）',interval,False)]):
@@ -30,6 +30,12 @@ def main(smoke=False):
     def choose_group(event=None):
         group_id.set(groups.get(group_name.get(),'')); destination.set('グループ')
     groupbox.bind('<<ComboboxSelected>>',choose_group)
+    notification_frame=ttk.LabelFrame(frame,text='通知する項目',padding=10); notification_frame.pack(fill='x',pady=(10,0))
+    ttk.Label(notification_frame,text='固定：優先事項 — 発射の事実（発射の可能性・訂正も必ず通知）',font=('Yu Gothic UI',11,'bold')).grid(row=0,column=0,columnspan=3,sticky='w',pady=(0,6))
+    field_vars={key:tk.BooleanVar(value=enabled) for key,enabled in options(config).items() if key in FIELDS}
+    for i,(key,label) in enumerate(FIELDS.items()):
+        ttk.Checkbutton(notification_frame,text=label,variable=field_vars[key],command=lambda:save()).grid(row=1+i//3,column=i%3,sticky='w',padx=(0,24),pady=3)
+    ttk.Label(notification_frame,text='チェック変更は自動保存。未選択項目だけの変更は通知しません。履歴はこのPCに保存します。').grid(row=3,column=0,columnspan=3,sticky='w',pady=(6,0))
     bar=ttk.Frame(frame); bar.pack(fill='x',pady=10)
     summary=tk.StringVar(value='停止中 / Signal・Xの連携設定を行ってください')
     ttk.Label(frame,textvariable=summary).pack(anchor='w')
@@ -52,7 +58,7 @@ def main(smoke=False):
             messagebox.showerror('送信先','「グループ一覧を取得」で送信するグループを選んでください。'); return False
         if destination.get()=='個別' and not recipient.get().strip():
             messagebox.showerror('送信先','個別の送信先を入力してください。'); return False
-        config.update(signal_account=account.get().strip(),signal_recipient=recipient.get().strip() if destination.get()=='個別' else '',signal_group_id=group_id.get() if destination.get()=='グループ' else '',signal_group_name=group_name.get() if destination.get()=='グループ' else '',x_bearer_token=token.get().strip(),interval_seconds=seconds)
+        config.update(signal_account=account.get().strip(),signal_recipient=recipient.get().strip() if destination.get()=='個別' else '',signal_group_id=group_id.get() if destination.get()=='グループ' else '',signal_group_name=group_name.get() if destination.get()=='グループ' else '',x_bearer_token=token.get().strip(),interval_seconds=seconds,notification_fields={k:v.get() for k,v in field_vars.items()})
         save_config(config); engine.config=dict(config); return True
     def ensure_daemon():
         if daemon[0] is None or daemon[0].poll() is not None: daemon[0]=start_daemon()
@@ -103,7 +109,11 @@ def main(smoke=False):
         if not config['signal_account']: messagebox.showinfo('Signal','先に「SignalをQR連携」を押して連携してください。'); return
         if not started[0]: start()
         e={'source':'模擬テスト','title':'北朝鮮がミサイルを発射したという模擬情報','text':'北朝鮮が弾道ミサイルを2発発射した。EEZ外に落下する見込み。領海への落下情報は未発表。','url':'https://www.mod.go.jp/j/surround/northKorea/index.html','published':now(),'detected':now(),'test':True}
-        engine.enqueue(message(e)); engine.enqueue(message(e,True),10)
+        engine.enqueue(message(e,config=engine.config))
+    def preview():
+        if not save(): return
+        e={'source':'模擬プレビュー','title':'北朝鮮がミサイルを発射したという模擬情報','text':'本日午前6時30分に北朝鮮が弾道ミサイルを2発発射した。午前7時10分ごろEEZ外・領海外に落下する見込み。','url':'https://www.mod.go.jp/j/surround/northKorea/index.html','published':now(),'detected':now(),'test':True}
+        win=tk.Toplevel(root); win.title('通知プレビュー（送信しません）'); box=scrolledtext.ScrolledText(win,width=80,height=22,wrap='word'); box.pack(fill='both',expand=True); box.insert('1.0',message(e,config=engine.config)); box.config(state='disabled')
     def clear():
         with engine.lock: engine.db.execute('DELETE FROM outbox WHERE sent IS NULL'); engine.db.commit()
         ui_log('未送信キューを削除しました。')
@@ -112,6 +122,7 @@ def main(smoke=False):
     ttk.Button(bar,text='監視開始',command=start).pack(side='left',padx=3)
     ttk.Button(bar,text='模擬発射をSignalへ送信',command=test).pack(side='left',padx=3)
     ttk.Button(bar,text='未送信キューを消去',command=clear).pack(side='left',padx=3)
+    ttk.Button(bar,text='通知プレビュー',command=preview).pack(side='left',padx=3)
     qrwindow=[None]
     def tick():
         while not engine.events.empty():

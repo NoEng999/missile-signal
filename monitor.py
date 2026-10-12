@@ -8,12 +8,13 @@ import xml.etree.ElementTree as ET
 import requests
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
+from intelligence import FIELDS, options, extract, render, canonical_url, semantic_signature
 
 ROOT=Path(__file__).resolve().parent
 DATA=ROOT/'data'; DATA.mkdir(exist_ok=True)
 JST=timezone(timedelta(hours=9))
 def now(): return datetime.now(JST).isoformat(timespec='seconds')
-DEFAULT={'interval_seconds':10,'signal_account':'','signal_recipient':'','signal_group_id':'','signal_group_name':'','x_bearer_token':'','signal_rpc':'http://127.0.0.1:18765/api/v1/rpc'}
+DEFAULT={'interval_seconds':10,'signal_account':'','signal_recipient':'','signal_group_id':'','signal_group_name':'','x_bearer_token':'','signal_rpc':'http://127.0.0.1:18765/api/v1/rpc','notification_fields':dict.fromkeys(FIELDS,True)}
 def signal_destination(config):
     group=config.get('signal_group_id','').strip()
     if group: return {'groupId':group}
@@ -38,19 +39,22 @@ def details(t):
         lines.append(label+': '+(' / '.join(dict.fromkeys(matches)) if matches else '未発表／自動抽出できず'))
     if not re.search(r'[0-9０-９]{1,2}時[0-9０-９]{1,2}分|[0-9]{1,2}:[0-9]{2}',lines[-1]): lines[-1]='弾着予想時刻: 未発表／自動抽出できず'
     return '\n'.join(lines)
-def message(e,full=False):
-    text=e['text']; status=classify(text) or '続報'
-    prefix='【テスト・実際の発射ではありません】\n' if e.get('test') else ''
-    return prefix+f"【北朝鮮ミサイル {'詳細' if full else '速報'}】\n{status}\n{e['title']}\n"+(details(text)+'\n内容（抜粋）: '+text[:650]+'\n' if full else '')+f"発表日時: {e.get('published') or '情報源で確認'}\n検知日時: {e['detected']}\n情報源: {e['source']}\n{e['url']}"
+def message(e,full=False,config=None):
+    facts=extract(e); facts['status']=classify(e['text']) or '続報'
+    return render(e,facts,config or DEFAULT,first=not full)
 
 class Engine:
     def __init__(self,config=None):
-        self.config=config or load_config(); self.stop=threading.Event(); self.events=queue.Queue(); self.lock=threading.Lock()
+        self.config=config or load_config(); self.stop=threading.Event(); self.events=queue.Queue(); self.lock=threading.RLock()
+        self.detail_inflight=set()
         self.pool=cf.ThreadPoolExecutor(max_workers=8); self.status={}; self.threads=[]; self.responses=[]
         self.db=sqlite3.connect(DATA/'monitor.sqlite3',check_same_thread=False)
         self.db.execute('CREATE TABLE IF NOT EXISTS seen (key TEXT PRIMARY KEY)')
         self.db.execute('CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY, body TEXT, created TEXT, sent TEXT, attempts INTEGER DEFAULT 0, due REAL DEFAULT 0, priority INTEGER DEFAULT 0)')
         if 'priority' not in [r[1] for r in self.db.execute('PRAGMA table_info(outbox)')]: self.db.execute('ALTER TABLE outbox ADD COLUMN priority INTEGER DEFAULT 0')
+        self.db.execute('CREATE TABLE IF NOT EXISTS incidents (id TEXT PRIMARY KEY, facts TEXT NOT NULL, notified INTEGER DEFAULT 0, updated TEXT NOT NULL)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS reports (url TEXT PRIMARY KEY, incident_id TEXT NOT NULL)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS report_history (id INTEGER PRIMARY KEY, incident_id TEXT, source TEXT, url TEXT, observed TEXT, facts TEXT)')
         self.db.commit(); self.logging=logging.getLogger('monitor')
         if not self.logging.handlers:
             from logging.handlers import RotatingFileHandler
@@ -69,10 +73,61 @@ class Engine:
         self.log(body)
     def accept(self,e,baseline=False):
         key=e['source']+'|'+e['url']+'|'+hashlib.sha256(e['text'].encode()).hexdigest()
-        if not self.unseen(key) or baseline: return
+        if not self.unseen(key): return
         if not relevant(e['text']+' '+e['title']) or not classify(e['text']+' '+e['title']): return
-        e['detected']=now(); self.enqueue(message(e)); self.enqueue(message(e,True),10)
-        return True
+        facts=extract(e); facts['status']=classify(e['text']+' '+e['title']) or '続報'
+        e=dict(e,detected=now()); url=canonical_url(e['url'])
+        with self.lock:
+            mapped=self.db.execute('SELECT incident_id FROM reports WHERE url=?',(url,)).fetchone()
+            # Match outlets only on an explicit launch timestamp. Uncertain identities stay separate.
+            iid='launch|'+facts['launch_key'] if facts.get('launch_key') else (mapped[0] if mapped else 'report|'+url)
+            row=self.db.execute('SELECT facts,notified FROM incidents WHERE id=?',(iid,)).fetchone()
+            if not row and mapped:
+                oldrow=self.db.execute('SELECT facts,notified FROM incidents WHERE id=?',(mapped[0],)).fetchone()
+                if oldrow:
+                    oldfacts=json.loads(oldrow[0])
+                    if not oldfacts.get('launch_key') or facts.get('correction'):
+                        row=oldrow
+                        self.db.execute('UPDATE reports SET incident_id=? WHERE incident_id=?',(iid,mapped[0]))
+                        self.db.execute('UPDATE report_history SET incident_id=? WHERE incident_id=?',(iid,mapped[0]))
+                        self.db.execute('DELETE FROM incidents WHERE id=?',(mapped[0],))
+            previous=json.loads(row[0]) if row else {}; notified=bool(row and row[1])
+            merged=dict(previous)
+            # Missing fields never erase previously learned facts.
+            for k,v in facts.items():
+                if v not in (None,'',False): merged[k]=v
+            if facts.get('water_zones') or previous.get('water_zones'):
+                merged['water_zones']=previous.get('water_zones',{}) | facts.get('water_zones',{})
+                merged['waters']=' / '.join(merged['water_zones'].values())
+            merged['additional']=previous.get('additional',{}) | facts.get('additional',{})
+            merged['correction']=facts.get('correction',False)
+            if facts['status']=='続報' and previous.get('status'): merged['status']=previous['status']
+            if '可能性' in facts['status'] and previous.get('status') and '可能性' not in previous['status'] and not facts.get('correction'):
+                merged['status']=previous['status']
+            changed=[k for k in ('status','count','eta','waters','published','content') if merged.get(k)!=previous.get(k)]
+            selected=options(self.config)
+            substantive=[k for k in changed if k=='status' or (k in ('count','eta','waters') and selected.get(k))]
+            # Text-only revisions are sent only on the same report URL, or for an explicit correction.
+            extra_changed=any(previous.get('additional',{}).get(k)!=v for k,v in facts.get('additional',{}).items())
+            if selected.get('content') and extra_changed: substantive.append('content')
+            if facts.get('correction') and (semantic_signature(merged,merged['status'])!=semantic_signature(previous,previous.get('status')) or merged.get('content')!=previous.get('content')):
+                substantive.append('status')
+            should_send=(not baseline or notified) and (not notified or bool(substantive))
+            self.db.execute('INSERT OR REPLACE INTO reports VALUES (?,?)',(url,iid))
+            self.db.execute('INSERT INTO report_history(incident_id,source,url,observed,facts) VALUES (?,?,?,?,?)',(iid,e['source'],e['url'],e['detected'],json.dumps(facts,ensure_ascii=False)))
+            self.db.execute('INSERT OR REPLACE INTO incidents VALUES (?,?,?,?)',(iid,json.dumps(merged,ensure_ascii=False),int(notified or should_send),e['detected']))
+            self.db.commit()
+            if should_send:
+                self.enqueue(render(e,merged,self.config,changed,first=not notified),0 if not notified else 10)
+                return True
+        self.log('履歴更新／重複または非選択項目の変更を抑止: '+e['source'])
+    def schedule_detail(self,e,baseline=False):
+        if not relevant(e['text']+' '+e['title']): return
+        url=canonical_url(e['url'])
+        with self.lock:
+            if url in self.detail_inflight or self.stop.is_set(): return
+            self.detail_inflight.add(url)
+        self.pool.submit(self.nhk_detail,dict(e),baseline)
     def article(self,url):
         r=self.fetch(url)
         if 'application/pdf' in r.headers.get('Content-Type','') or url.endswith('.pdf'):
@@ -102,7 +157,8 @@ class Engine:
         for item in items:
             title=item.findtext('title',''); desc=BeautifulSoup(item.findtext('description',''),'html.parser').get_text(' ',strip=True)
             e={'source':'NHK RSS','title':title,'text':title+' '+desc,'url':item.findtext('link',''),'published':item.findtext('pubDate','')}
-            if self.accept(e,baseline): self.pool.submit(self.nhk_detail,e)
+            self.accept(e,baseline)
+            self.schedule_detail(e,baseline)
         return len(items)
     def nhk_web(self,baseline):
         url='https://news.web.nhk/newsweb'; soup=BeautifulSoup(self.fetch(url).content.decode('utf-8','replace'),'html.parser'); count=0
@@ -111,15 +167,17 @@ class Engine:
             if '/newsweb/na/' not in href or not title: continue
             count+=1
             e={'source':'NHK Web','title':title,'text':title,'url':href,'published':''}
-            notified=self.accept(e,baseline)
-            if notified and self.unseen('nhk-detail|'+href): self.pool.submit(self.nhk_detail,e)
+            self.accept(e,baseline)
+            self.schedule_detail(e,baseline)
         if not count: raise ValueError('ニュースリンクを取得できません')
         return count
-    def nhk_detail(self,e):
+    def nhk_detail(self,e,baseline=False):
         try:
             text=self.article(e['url']); e=dict(e,text=e['title']+' '+text,detected=now())
-            if classify(e['text']): self.enqueue(message(e,True),10)
+            self.accept(e,baseline)
         except Exception as ex: self.log('NHK詳細取得エラー: '+type(ex).__name__)
+        finally:
+            with self.lock: self.detail_inflight.discard(canonical_url(e['url']))
     def poll(self,name,func):
         baseline=True
         while not self.stop.is_set():

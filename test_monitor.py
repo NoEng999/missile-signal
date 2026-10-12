@@ -15,14 +15,14 @@ class Tests(unittest.TestCase):
         for h in list(self.e.logging.handlers): h.close(); self.e.logging.removeHandler(h)
         self.e.close(); self.e.db.close(); monitor.DATA=self.old; self.tmp.cleanup()
     def event(self,**changes):
-        return dict(source='NHK Web',title='北朝鮮 ミサイル発射',text='北朝鮮がミサイルを2発発射した。EEZ外に落下する見込み。',url='https://example.test/1',published=monitor.now(),**changes)
+        return dict(source='NHK Web',title='北朝鮮 ミサイル発射',text='北朝鮮がミサイルを2発発射した。EEZ外に落下する見込み。',url='https://example.test/1',published=monitor.now()) | changes
     def test_no_historic_alert_then_new_and_cross_source(self):
         e=self.event(); self.e.accept(e,True); self.e.accept(e)
         self.assertEqual(self.e.counts()[0],0)
         e['url']+='new'; self.e.accept(e); self.e.accept(e)
-        self.assertEqual(self.e.counts()[0],2)
+        self.assertEqual(self.e.counts()[0],1)
         e['source']='防衛省 Web'; self.e.accept(e)
-        self.assertEqual(self.e.counts()[0],4)
+        self.assertEqual(self.e.counts()[0],1)
     def test_uncertainty_plans_and_details(self):
         self.assertIsNone(monitor.classify('北朝鮮がミサイルを発射する計画'))
         self.assertIn('可能性',monitor.classify('北朝鮮からミサイルが発射された可能性があります'))
@@ -33,9 +33,48 @@ class Tests(unittest.TestCase):
         class Response:
             content='<a href="/newsweb/na/old">北朝鮮 ミサイル発射</a>'.encode()
         self.e.fetch=lambda url:Response()
-        calls=[]; self.e.nhk_detail=lambda e:calls.append(e)
+        self.e.article=lambda url:'北朝鮮 ミサイル発射'
         self.e.nhk_web(True); self.e.nhk_web(False)
-        self.assertEqual(self.e.counts()[0],0); self.assertEqual(calls,[])
+        self.e.pool.shutdown(wait=True)
+        self.assertEqual(self.e.counts()[0],0)
+    def launch(self,**changes):
+        return self.event(text='本日午前6時30分に北朝鮮がミサイルを2発発射した。EEZ外に落下する見込み。',published='2026-10-12T07:00:00+09:00') | changes
+    def test_cross_outlet_dedup_and_new_eta(self):
+        self.e.accept(self.launch())
+        self.e.accept(self.launch(source='防衛省 Web',url='https://example.test/mod',published='2026-10-12T07:02:00+09:00'))
+        self.assertEqual(self.e.counts()[0],1)
+        e=self.launch(text=self.launch()['text']+'午前7時10分にEEZ外に落下する見込み。')
+        self.e.accept(e); self.assertEqual(self.e.counts()[0],2)
+        self.e.accept(e); self.assertEqual(self.e.counts()[0],2)
+    def test_distinct_launch_and_uncertain_identity_not_merged(self):
+        self.e.accept(self.launch())
+        self.e.accept(self.launch(text=self.launch()['text'].replace('6時30分','8時30分'),url='https://example.test/new'))
+        self.e.accept(self.event(url='https://example.test/ambiguous'))
+        self.assertEqual(self.e.counts()[0],3)
+    def test_disabled_options_and_correction(self):
+        self.e.config['notification_fields']=dict.fromkeys(monitor.FIELDS,False)
+        self.e.accept(self.launch())
+        body=self.e.db.execute('SELECT body FROM outbox').fetchone()[0]
+        self.assertIn('優先事項',body)
+        for x in ('発射弾数','弾着予想','EEZ','発表日時','情報源：','https://','2発'): self.assertNotIn(x,body)
+        self.e.accept(self.launch(text=self.launch()['text'].replace('2発','3発')))
+        self.assertEqual(self.e.counts()[0],1)
+        self.e.accept(self.launch(text='訂正。'+self.launch()['text'].replace('2発','1発')))
+        self.assertEqual(self.e.counts()[0],2)
+    def test_learned_facts_persist_and_missing_fields_do_not_erase(self):
+        self.e.accept(self.launch())
+        other=monitor.Engine(dict(monitor.DEFAULT))
+        try:
+            other.accept(self.launch(source='NHK RSS',url='https://example.test/another'))
+            self.assertEqual(other.counts()[0],1)
+            other.accept(self.launch(text='本日午前6時30分に北朝鮮がミサイルを発射した。'))
+            facts=json.loads(other.db.execute('SELECT facts FROM incidents').fetchone()[0])
+            self.assertEqual(facts['count'],'2発'); self.assertEqual(other.counts()[0],1)
+        finally: other.close(); other.db.close()
+    def test_unknown_water_status_is_not_inferred(self):
+        from intelligence import extract
+        f=extract(self.launch(text='本日午前6時30分に北朝鮮がミサイルを発射した。領海内への落下情報は未発表。EEZ外に落下する見込み。'))
+        self.assertIn('EEZ外',f['waters']); self.assertNotIn('領海',f['waters'])
     def test_priority_and_rpc_delivery(self):
         captured=[]
         class Handler(BaseHTTPRequestHandler):
