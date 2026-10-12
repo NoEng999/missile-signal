@@ -1,0 +1,9 @@
+{
+  "interval_seconds": 10,
+  "signal_account": "",
+  "signal_recipient": "",
+  "signal_group_id": "",
+  "signal_group_name": "",
+  "x_bearer_token": "",
+  "signal_rpc": "http://127.0.0.1:18765/api/v1/rpc"
+}
